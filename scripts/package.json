@@ -1,0 +1,8 @@
+{
+  "name": "shipnity-sync",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "puppeteer": "^23.0.0"
+  }
+}

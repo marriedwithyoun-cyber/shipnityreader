@@ -1,0 +1,37 @@
+name: Sync Shipnity orders
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'  # every 3 hours; adjust to taste
+  workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: scripts
+        run: npm install
+
+      - name: Run sync
+        working-directory: scripts
+        env:
+          SHIPNITY_USER: ${{ secrets.SHIPNITY_USER }}
+          SHIPNITY_PASS: ${{ secrets.SHIPNITY_PASS }}
+          SYNC_ENDPOINT: ${{ secrets.SYNC_ENDPOINT }}
+          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
+        run: node shipnity-sync.js
+
+      - name: Upload error screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shipnity-error-screenshot
+          path: scripts/shipnity-error.png
+          if-no-files-found: ignore
