@@ -20,11 +20,10 @@
 // finished yet, and re-scraping all 4,246 every cycle isn't practical.
 // Revisit this if closed orders ever need to stay searchable.
 //
-// UNVERIFIED: the pagination flow below (typing a page number into the
-// "ไปที่หน้า" input and pressing Enter) is based on a static HTML dump,
-// not a live test run - it has not been executed end-to-end yet. Run
-// this once manually (workflow_dispatch) and check shipnity-error.png
-// / the Actions log before trusting the schedule.
+// The pagination flow (typing a page number into the "ไปที่หน้า" input
+// and pressing Enter) has been confirmed live to reach and walk pages
+// successfully. It was however extremely slow on the first real run
+// (see the waitForCacheGrowth comment below for why and the fix).
 //
 // Required environment variables (set as GitHub Actions secrets):
 //   SHIPNITY_USER   - Shipnity login email
@@ -104,8 +103,35 @@ async function main() {
     }
 
     // ---------- Walk the order list, letting Apollo's cache accumulate ----------
+    // Deliberately NOT using waitForNetworkIdle here: Shipnity has
+    // background analytics traffic (Hotjar etc.) running constantly, so
+    // the network never truly goes idle and every page transition was
+    // eating its full 15s timeout (~7 minutes just for pagination on a
+    // 28-page run). Polling the actual thing we care about - whether
+    // Apollo's cache grew - is both correct and much faster in practice.
+    async function currentOrderCount() {
+      return page.evaluate(() => {
+        const cache = window.__APOLLO_CLIENT__.cache.extract();
+        return Object.keys(cache).filter((k) => k.startsWith('Order:')).length;
+      });
+    }
+    async function waitForCacheGrowth(beforeCount, { timeout = 8000, pollInterval = 150 } = {}) {
+      const start = Date.now();
+      while (Date.now() - start < timeout) {
+        const count = await currentOrderCount();
+        if (count > beforeCount) return count;
+        await new Promise((r) => setTimeout(r, pollInterval));
+      }
+      return null; // timed out - caller decides whether that's fatal
+    }
+
     console.log('[2/4] Loading order list...');
-    await page.goto('https://www.shipnity.com/order/', { waitUntil: 'networkidle2' });
+    await page.goto('https://www.shipnity.com/order/', { waitUntil: 'domcontentloaded' });
+    const firstPageCount = await waitForCacheGrowth(0, { timeout: 15000 });
+    if (firstPageCount === null) {
+      throw new Error('Order list never populated the Apollo cache within 15s - page structure or auth may have changed.');
+    }
+    console.log(`[2/4] First page loaded (${firstPageCount} orders in cache so far).`);
 
     const pagesCount = await page.evaluate(() => {
       const input = document.querySelector('.pagination__page-input input');
@@ -114,19 +140,23 @@ async function main() {
     const lastPage = Math.min(pagesCount || 1, MAX_PAGES);
     console.log(`[2/4] Found ${pagesCount || 1} page(s) of orders, visiting ${lastPage}.`);
 
-    for (let p = 1; p <= lastPage; p++) {
-      if (p > 1) {
-        await page.evaluate((pageNum) => {
-          const input = document.querySelector('.pagination__page-input input');
-          if (!input) return;
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          setter.call(input, String(pageNum));
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-        }, p);
-        await page.keyboard.press('Enter');
-        await page.waitForNetworkIdle({ idleTime: 500, timeout: 15000 }).catch(() => {});
-        console.log(`[2/4] Visited page ${p}/${lastPage}.`);
+    let runningCount = firstPageCount;
+    for (let p = 2; p <= lastPage; p++) {
+      await page.evaluate((pageNum) => {
+        const input = document.querySelector('.pagination__page-input input');
+        if (!input) return;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(input, String(pageNum));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }, p);
+      await page.keyboard.press('Enter');
+      const newCount = await waitForCacheGrowth(runningCount);
+      if (newCount === null) {
+        console.warn(`[2/4] Page ${p}: cache didn't grow within 8s - likely the last page had fewer new orders than expected, continuing anyway.`);
+      } else {
+        runningCount = newCount;
       }
+      console.log(`[2/4] Visited page ${p}/${lastPage} (${runningCount} orders in cache so far).`);
     }
 
     // ---------- Pull everything out of the Apollo cache at once ----------
