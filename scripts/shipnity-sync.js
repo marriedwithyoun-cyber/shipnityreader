@@ -122,6 +122,7 @@ async function main() {
               invoiceNumber
               slug
               closed
+              unpaidAmount
               purchases { name }
             }
           }
@@ -166,6 +167,7 @@ async function main() {
         invoiceNumber: o.invoiceNumber || '',
         products: (o.purchases || []).map((p) => p.name).filter(Boolean),
         link: o.slug ? `https://cf.shipnity.com/${o.slug}` : '',
+        unpaidAmount: typeof o.unpaidAmount === 'number' ? o.unpaidAmount : 0,
       }));
 
     if (!orders.length) {
