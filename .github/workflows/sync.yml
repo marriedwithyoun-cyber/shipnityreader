@@ -8,6 +8,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # safety cap - worst case is ~70 pages x 75s retries
     steps:
       - uses: actions/checkout@v4
 

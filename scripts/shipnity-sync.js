@@ -127,9 +127,9 @@ async function main() {
 
     console.log('[2/4] Loading order list...');
     await page.goto('https://www.shipnity.com/order/', { waitUntil: 'domcontentloaded' });
-    const firstPageCount = await waitForCacheGrowth(0, { timeout: 15000 });
+    const firstPageCount = await waitForCacheGrowth(0, { timeout: 30000 });
     if (firstPageCount === null) {
-      throw new Error('Order list never populated the Apollo cache within 15s - page structure or auth may have changed.');
+      throw new Error('Order list never populated the Apollo cache within 30s - page structure or auth may have changed.');
     }
     console.log(`[2/4] First page loaded (${firstPageCount} orders in cache so far).`);
 
@@ -145,36 +145,41 @@ async function main() {
     // approach never actually triggered Vuetify's pagination (verified
     // live - the cache-growth check below caught it staying on page 1
     // for the entire run).
+    //
+    // Shipnity itself is sometimes just slow to respond after a page
+    // turn (confirmed by observation, not an artifact of this script) -
+    // so each page gets several patient retries (25s wait each, up to 3
+    // tries = ~75s worst case) before we give up. Completeness matters
+    // more than speed here: no silent partial syncs - if a page truly
+    // won't load, the whole run fails loudly instead of quietly missing
+    // orders.
     let runningCount = firstPageCount;
-    let consecutiveStalls = 0;
     for (let p = 2; p <= lastPage; p++) {
       const nextBtn = await page.$('button[aria-label="หน้าต่อไป"]');
       if (!nextBtn) {
-        console.warn(`[2/4] "Next page" button not found at page ${p} - stopping pagination early.`);
-        break;
+        throw new Error(`"Next page" button not found at page ${p} - Shipnity's page structure may have changed.`);
       }
       const disabled = await page.evaluate((el) => el.disabled || el.classList.contains('v-pagination__navigation--disabled'), nextBtn);
       if (disabled) {
         console.log(`[2/4] "Next page" button disabled at page ${p} - reached the last page.`);
         break;
       }
-      await nextBtn.click();
-      const newCount = await waitForCacheGrowth(runningCount);
-      if (newCount === null) {
-        consecutiveStalls++;
-        console.warn(`[2/4] Page ${p}: cache didn't grow within 8s (stall #${consecutiveStalls}).`);
-        if (consecutiveStalls >= 3) {
-          // Stop paginating rather than throwing - whatever's already in
-          // the cache (runningCount orders, gathered from real pages) is
-          // still good data and worth syncing, better than discarding a
-          // mostly-successful run over the last few stuck pages.
-          console.warn(`[2/4] Stuck for 3 consecutive page turns at page ${p} - stopping pagination early, syncing the ${runningCount} order(s) gathered so far.`);
-          break;
+
+      let newCount = null;
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt <= maxAttempts && newCount === null; attempt++) {
+        const btn = await page.$('button[aria-label="หน้าต่อไป"]');
+        if (btn) await btn.click().catch(() => {});
+        newCount = await waitForCacheGrowth(runningCount, { timeout: 25000 });
+        if (newCount === null) {
+          console.warn(`[2/4] Page ${p}: still hasn't loaded after ${attempt}/${maxAttempts} attempts (Shipnity is responding slowly) - retrying...`);
         }
-      } else {
-        consecutiveStalls = 0;
-        runningCount = newCount;
       }
+
+      if (newCount === null) {
+        throw new Error(`Page ${p} never loaded after ${maxAttempts} attempts (~75s) - aborting rather than syncing an incomplete order list.`);
+      }
+      runningCount = newCount;
       console.log(`[2/4] Visited page ${p}/${lastPage} (${runningCount} orders in cache so far).`);
     }
 
