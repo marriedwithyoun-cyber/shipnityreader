@@ -140,20 +140,34 @@ async function main() {
     const lastPage = Math.min(pagesCount || 1, MAX_PAGES);
     console.log(`[2/4] Found ${pagesCount || 1} page(s) of orders, visiting ${lastPage}.`);
 
+    // Clicking the real "next page" button, rather than typing a page
+    // number into the jump-to-page input, because the input-manipulation
+    // approach never actually triggered Vuetify's pagination (verified
+    // live - the cache-growth check below caught it staying on page 1
+    // for the entire run).
     let runningCount = firstPageCount;
+    let consecutiveStalls = 0;
     for (let p = 2; p <= lastPage; p++) {
-      await page.evaluate((pageNum) => {
-        const input = document.querySelector('.pagination__page-input input');
-        if (!input) return;
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(input, String(pageNum));
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-      }, p);
-      await page.keyboard.press('Enter');
+      const nextBtn = await page.$('button[aria-label="หน้าต่อไป"]');
+      if (!nextBtn) {
+        console.warn(`[2/4] "Next page" button not found at page ${p} - stopping pagination early.`);
+        break;
+      }
+      const disabled = await page.evaluate((el) => el.disabled || el.classList.contains('v-pagination__navigation--disabled'), nextBtn);
+      if (disabled) {
+        console.log(`[2/4] "Next page" button disabled at page ${p} - reached the last page.`);
+        break;
+      }
+      await nextBtn.click();
       const newCount = await waitForCacheGrowth(runningCount);
       if (newCount === null) {
-        console.warn(`[2/4] Page ${p}: cache didn't grow within 8s - likely the last page had fewer new orders than expected, continuing anyway.`);
+        consecutiveStalls++;
+        console.warn(`[2/4] Page ${p}: cache didn't grow within 8s (stall #${consecutiveStalls}).`);
+        if (consecutiveStalls >= 3) {
+          throw new Error('Cache stopped growing for 3 consecutive page turns - pagination is stuck, aborting.');
+        }
       } else {
+        consecutiveStalls = 0;
         runningCount = newCount;
       }
       console.log(`[2/4] Visited page ${p}/${lastPage} (${runningCount} orders in cache so far).`);
