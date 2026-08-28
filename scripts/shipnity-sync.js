@@ -42,7 +42,7 @@ const {
   SYNC_SECRET,
 } = process.env;
 
-const MAX_PAGES = 40; // safety cap; ~558 open orders / ~20 per page
+const MAX_PAGES = 70; // safety cap; confirmed live at 10 orders/page, ~56 pages for ~558 open orders
 
 function requireEnv(name, value) {
   if (!value) {
@@ -164,7 +164,12 @@ async function main() {
         consecutiveStalls++;
         console.warn(`[2/4] Page ${p}: cache didn't grow within 8s (stall #${consecutiveStalls}).`);
         if (consecutiveStalls >= 3) {
-          throw new Error('Cache stopped growing for 3 consecutive page turns - pagination is stuck, aborting.');
+          // Stop paginating rather than throwing - whatever's already in
+          // the cache (runningCount orders, gathered from real pages) is
+          // still good data and worth syncing, better than discarding a
+          // mostly-successful run over the last few stuck pages.
+          console.warn(`[2/4] Stuck for 3 consecutive page turns at page ${p} - stopping pagination early, syncing the ${runningCount} order(s) gathered so far.`);
+          break;
         }
       } else {
         consecutiveStalls = 0;
