@@ -1,34 +1,37 @@
-// Reads order data straight out of Shipnity's Apollo GraphQL cache
+// Reads order data straight from Shipnity's own GraphQL API
 // (read-only) and pushes a snapshot to the live site's sync endpoint,
 // which stores it in Netlify Blobs for netlify/functions/lookup.js to
-// serve. No button-clicking/modal-opening per order - confirmed live
-// (via window.__APOLLO_CLIENT__.cache.extract() in an authenticated
-// browser tab) that phone number, invoice number, and line items are
-// all already present in the order-list query's own cached response;
-// the "รายการสินค้า" modal just reads from that existing cache instead
-// of firing a new request. The payment link is `https://cf.shipnity.com/<slug>`,
-// confirmed by comparing an order's `slug` field against its real
-// "ชำระเงิน" link.
+// serve.
 //
-// Runs as a scheduled GitHub Actions job (see
-// .github/workflows/sync-shipnity.yml), not on Netlify - Netlify
-// Functions can't carry a full Chromium install.
+// History: earlier versions of this script clicked through the order
+// list's pagination in a real browser and read Apollo's client-side
+// cache. That worked but was slow and occasionally flaky (Shipnity is
+// sometimes slow to respond after a page turn). Captured the actual
+// network request Shipnity's own frontend sends when you click "next
+// page" (via a fetch() interceptor in an authenticated browser tab)
+// and found:
+//   - It's a POST to /api/graphql, auth'd by the session cookie plus
+//     an `x-csrf-token` header - whose value is just read from the
+//     (non-httpOnly) `CSRF-TOKEN` cookie, so it's trivially available
+//     to any same-origin fetch() from within the logged-in page.
+//   - The query takes `page`/`perPage` variables and the server
+//     accepts perPage far larger than the UI's own default of 10 -
+//     confirmed perPage: 200 works, turning ~56 page-clicks into 3
+//     plain HTTP requests.
+//   - orderStatus: "OPEN" server-side filters to exactly the open/
+//     unclosed orders (confirmed nodesCount matches the "558" badge
+//     shown in the dashboard UI), so no client-side filtering by
+//     `closed` is even required, though it's kept as a safety net.
+// So: log in with Puppeteer (only way to get a valid session), then
+// call the API directly via fetch() from inside the page - no DOM
+// interaction, no waiting for renders, no pagination clicking at all.
 //
-// Scope: only orders where `closed === false` (i.e. still open/active)
-// are synced. Shipnity holds ~4,246 orders total across its full
-// history; a customer realistically only searches for one that hasn't
-// finished yet, and re-scraping all 4,246 every cycle isn't practical.
-// Revisit this if closed orders ever need to stay searchable.
-//
-// The pagination flow (typing a page number into the "ไปที่หน้า" input
-// and pressing Enter) has been confirmed live to reach and walk pages
-// successfully. It was however extremely slow on the first real run
-// (see the waitForCacheGrowth comment below for why and the fix).
+// Runs as a scheduled GitHub Actions job (see .github/workflows/sync.yml),
+// not on Netlify - Netlify Functions can't carry a full Chromium install.
 //
 // Required environment variables (set as GitHub Actions secrets):
 //   SHIPNITY_USER   - Shipnity login email
-//   SHIPNITY_PASS   - Shipnity login password (rotate if it was ever
-//                     pasted anywhere in plaintext, e.g. a chat log)
+//   SHIPNITY_PASS   - Shipnity login password
 //   SYNC_ENDPOINT   - e.g. https://prewithmarry.app/api/sync-orders
 //   SYNC_SECRET     - shared secret, must match the Netlify env var of
 //                     the same name (see sync-orders.js)
@@ -42,7 +45,8 @@ const {
   SYNC_SECRET,
 } = process.env;
 
-const MAX_PAGES = 70; // safety cap; confirmed live at 10 orders/page, ~56 pages for ~558 open orders
+const PER_PAGE = 200;
+const MAX_PAGES = 20; // safety cap - real total is ~3 pages at perPage 200
 
 function requireEnv(name, value) {
   if (!value) {
@@ -59,10 +63,6 @@ async function main() {
   const browser = await puppeteer.launch({
     headless: 'new',
     args: [
-      // Required on GitHub Actions' Linux runners - Chromium's setuid
-      // sandbox needs privileges the runner's container doesn't grant,
-      // so without these two flags the browser fails to launch at all
-      // (this was almost certainly the exit-code-1 cause).
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-background-networking',
@@ -76,8 +76,6 @@ async function main() {
     const page = await browser.newPage();
     await page.setViewport({ width: 1400, height: 900 });
 
-    // Skip images/fonts/media/stylesheets - we only ever read data out
-    // of the JS-side Apollo cache, never anything visual.
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
@@ -89,7 +87,7 @@ async function main() {
     });
 
     // ---------- Login ----------
-    console.log('[1/4] Loading login page...');
+    console.log('[1/3] Loading login page...');
     await page.goto('https://shipnity.com/authen/', { waitUntil: 'networkidle2' });
     await page.type('input[type="text"]', SHIPNITY_USER, { delay: 20 });
     await page.type('input[type="password"]', SHIPNITY_PASS, { delay: 20 });
@@ -97,125 +95,85 @@ async function main() {
       page.click('button[type="submit"]'),
       page.waitForNavigation({ waitUntil: 'networkidle2' }),
     ]);
-    console.log(`[1/4] Login submitted. Current URL: ${page.url()}`);
+    console.log(`[1/3] Login submitted. Current URL: ${page.url()}`);
     if (page.url().includes('/authen')) {
       throw new Error('Still on the login page after submitting - credentials likely rejected.');
     }
 
-    // ---------- Walk the order list, letting Apollo's cache accumulate ----------
-    // Deliberately NOT using waitForNetworkIdle here: Shipnity has
-    // background analytics traffic (Hotjar etc.) running constantly, so
-    // the network never truly goes idle and every page transition was
-    // eating its full 15s timeout (~7 minutes just for pagination on a
-    // 28-page run). Polling the actual thing we care about - whether
-    // Apollo's cache grew - is both correct and much faster in practice.
-    async function currentOrderCount() {
-      return page.evaluate(() => {
-        const cache = window.__APOLLO_CLIENT__.cache.extract();
-        return Object.keys(cache).filter((k) => k.startsWith('Order:')).length;
-      });
-    }
-    async function waitForCacheGrowth(beforeCount, { timeout = 8000, pollInterval = 150 } = {}) {
-      const start = Date.now();
-      while (Date.now() - start < timeout) {
-        const count = await currentOrderCount();
-        if (count > beforeCount) return count;
-        await new Promise((r) => setTimeout(r, pollInterval));
-      }
-      return null; // timed out - caller decides whether that's fatal
-    }
+    // Land on the order list once so the CSRF-TOKEN cookie is set for
+    // this session (should already be set post-login, but this is the
+    // confirmed-working state to fetch from).
+    await page.goto('https://www.shipnity.com/order/', { waitUntil: 'networkidle2' });
 
-    console.log('[2/4] Loading order list...');
-    await page.goto('https://www.shipnity.com/order/', { waitUntil: 'domcontentloaded' });
-    const firstPageCount = await waitForCacheGrowth(0, { timeout: 30000 });
-    if (firstPageCount === null) {
-      throw new Error('Order list never populated the Apollo cache within 30s - page structure or auth may have changed.');
-    }
-    console.log(`[2/4] First page loaded (${firstPageCount} orders in cache so far).`);
+    // ---------- Fetch every open order directly via the GraphQL API ----------
+    console.log('[2/3] Fetching orders via /api/graphql...');
+    const { orders: rawOrders, error: fetchError } = await page.evaluate(
+      async (perPage, maxPages) => {
+        const csrfCookie = document.cookie.split('; ').find((c) => c.startsWith('CSRF-TOKEN='));
+        if (!csrfCookie) return { orders: [], error: 'CSRF-TOKEN cookie not found - login may not have completed.' };
+        const csrf = decodeURIComponent(csrfCookie.split('=')[1]);
 
-    const pagesCount = await page.evaluate(() => {
-      const input = document.querySelector('.pagination__page-input input');
-      return input ? parseInt(input.getAttribute('max') || '1', 10) : 1;
-    });
-    const lastPage = Math.min(pagesCount || 1, MAX_PAGES);
-    console.log(`[2/4] Found ${pagesCount || 1} page(s) of orders, visiting ${lastPage}.`);
+        const query = `query ($perPage: Int, $page: Int, $orderStatus: OrderFilterEnum, $orderFilter: OrderQueryFilterInput, $sort: OrderResolverOrderBy) {
+          orderList(perPage: $perPage, page: $page, orderStatus: $orderStatus, orderFilter: $orderFilter, sort: $sort) {
+            nodesCount
+            pagesCount
+            nodes {
+              tel
+              invoiceNumber
+              slug
+              closed
+              purchases { name }
+            }
+          }
+        }`;
 
-    // Clicking the real "next page" button, rather than typing a page
-    // number into the jump-to-page input, because the input-manipulation
-    // approach never actually triggered Vuetify's pagination (verified
-    // live - the cache-growth check below caught it staying on page 1
-    // for the entire run).
-    //
-    // Shipnity itself is sometimes just slow to respond after a page
-    // turn (confirmed by observation, not an artifact of this script) -
-    // so each page gets several patient retries (25s wait each, up to 3
-    // tries = ~75s worst case) before we give up. Completeness matters
-    // more than speed here: no silent partial syncs - if a page truly
-    // won't load, the whole run fails loudly instead of quietly missing
-    // orders.
-    let runningCount = firstPageCount;
-    for (let p = 2; p <= lastPage; p++) {
-      const nextBtn = await page.$('button[aria-label="หน้าต่อไป"]');
-      if (!nextBtn) {
-        throw new Error(`"Next page" button not found at page ${p} - Shipnity's page structure may have changed.`);
-      }
-      const disabled = await page.evaluate((el) => el.disabled || el.classList.contains('v-pagination__navigation--disabled'), nextBtn);
-      if (disabled) {
-        console.log(`[2/4] "Next page" button disabled at page ${p} - reached the last page.`);
-        break;
-      }
-
-      let newCount = null;
-      const maxAttempts = 3;
-      for (let attempt = 1; attempt <= maxAttempts && newCount === null; attempt++) {
-        const btn = await page.$('button[aria-label="หน้าต่อไป"]');
-        if (btn) await btn.click().catch(() => {});
-        newCount = await waitForCacheGrowth(runningCount, { timeout: 25000 });
-        if (newCount === null) {
-          console.warn(`[2/4] Page ${p}: still hasn't loaded after ${attempt}/${maxAttempts} attempts (Shipnity is responding slowly) - retrying...`);
+        async function fetchPage(pageNum) {
+          const res = await fetch('/api/graphql', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-csrf-token': csrf },
+            body: JSON.stringify({
+              operationName: null,
+              variables: { page: pageNum, perPage, sort: 'id_DESC', orderStatus: 'OPEN', orderFilter: { filterType: 'ALL' } },
+              query,
+            }),
+          });
+          if (!res.ok) throw new Error(`GraphQL request failed with status ${res.status}`);
+          const json = await res.json();
+          if (json.errors) throw new Error(`GraphQL errors: ${JSON.stringify(json.errors)}`);
+          return json.data.orderList;
         }
-      }
 
-      if (newCount === null) {
-        throw new Error(`Page ${p} never loaded after ${maxAttempts} attempts (~75s) - aborting rather than syncing an incomplete order list.`);
-      }
-      runningCount = newCount;
-      console.log(`[2/4] Visited page ${p}/${lastPage} (${runningCount} orders in cache so far).`);
-    }
+        const first = await fetchPage(1);
+        const all = first.nodes.slice();
+        const pagesCount = Math.min(first.pagesCount || 1, maxPages);
+        for (let p = 2; p <= pagesCount; p++) {
+          const next = await fetchPage(p);
+          all.push(...next.nodes);
+        }
+        return { orders: all, error: null };
+      },
+      PER_PAGE,
+      MAX_PAGES
+    );
 
-    // ---------- Pull everything out of the Apollo cache at once ----------
-    console.log('[3/4] Extracting Apollo cache...');
-    const orders = await page.evaluate(() => {
-      const cache = window.__APOLLO_CLIENT__.cache.extract();
-      const orderKeys = Object.keys(cache).filter((k) => k.startsWith('Order:'));
+    if (fetchError) throw new Error(fetchError);
+    console.log(`[2/3] Fetched ${rawOrders.length} raw order record(s).`);
 
-      function resolvePurchases(order) {
-        const refs = Array.isArray(order.purchases) ? order.purchases : [];
-        return refs
-          .map((ref) => cache[ref.id])
-          .filter(Boolean)
-          .map((purchase) => purchase.name)
-          .filter(Boolean);
-      }
+    const orders = rawOrders
+      .filter((o) => o && o.closed === false && o.tel)
+      .map((o) => ({
+        tel: o.tel,
+        invoiceNumber: o.invoiceNumber || '',
+        products: (o.purchases || []).map((p) => p.name).filter(Boolean),
+        link: o.slug ? `https://cf.shipnity.com/${o.slug}` : '',
+      }));
 
-      return orderKeys
-        .map((key) => cache[key])
-        .filter((o) => o && o.closed === false && o.tel)
-        .map((o) => ({
-          tel: o.tel,
-          invoiceNumber: o.invoiceNumber || '',
-          products: resolvePurchases(o),
-          link: o.slug ? `https://cf.shipnity.com/${o.slug}` : '',
-        }));
-    });
-
-    console.log(`[3/4] Extracted ${orders.length} open order(s) from the cache.`);
     if (!orders.length) {
-      throw new Error('Extracted 0 orders from the Apollo cache - schema likely changed, aborting sync.');
+      throw new Error('Extracted 0 open orders from the API response - schema likely changed, aborting sync.');
     }
 
     // ---------- Push to the live site ----------
-    console.log('[4/4] Posting to sync endpoint...');
+    console.log('[3/3] Posting to sync endpoint...');
     const res = await fetch(SYNC_ENDPOINT, {
       method: 'POST',
       headers: {

@@ -8,13 +8,15 @@ See `SUMMARY.md` for current status and the setup steps still needed.
 
 ## How it works
 
-`scripts/shipnity-sync.js` logs into Shipnity with Puppeteer, then reads
-order data directly out of the page's Apollo GraphQL cache (phone
-number, invoice number, line items, and the slug used to build the
-payment link) instead of clicking into each order individually. Only
-open (unclosed) orders are synced. The result is POSTed to
-`prewithmarry.app`'s `sync-orders` endpoint, which stores it in Netlify
-Blobs for the site's order-lookup function to read.
+`scripts/shipnity-sync.js` logs into Shipnity with Puppeteer (only way
+to get a valid session), then calls Shipnity's own `/api/graphql`
+endpoint directly (same request its own frontend sends when you click
+"next page" - captured live via a fetch() interceptor) with a large
+`perPage`, fetching every open order in ~3 HTTP requests instead of
+clicking through ~56 pages. No DOM interaction or page rendering is
+needed for the data itself. The result is POSTed to `prewithmarry.app`'s
+`sync-orders` endpoint, which stores it in Netlify Blobs for the site's
+order-lookup function to read.
 
 `.github/workflows/sync.yml` runs this on a schedule (every 3 hours)
 and can also be triggered manually from the Actions tab.
