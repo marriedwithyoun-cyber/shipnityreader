@@ -60,6 +60,12 @@ async function main() {
   const browser = await puppeteer.launch({
     headless: 'new',
     args: [
+      // Required on GitHub Actions' Linux runners - Chromium's setuid
+      // sandbox needs privileges the runner's container doesn't grant,
+      // so without these two flags the browser fails to launch at all
+      // (this was almost certainly the exit-code-1 cause).
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
       '--disable-background-networking',
       '--no-first-run',
       '--disable-speech-api',
@@ -84,6 +90,7 @@ async function main() {
     });
 
     // ---------- Login ----------
+    console.log('[1/4] Loading login page...');
     await page.goto('https://shipnity.com/authen/', { waitUntil: 'networkidle2' });
     await page.type('input[type="text"]', SHIPNITY_USER, { delay: 20 });
     await page.type('input[type="password"]', SHIPNITY_PASS, { delay: 20 });
@@ -91,8 +98,13 @@ async function main() {
       page.click('button[type="submit"]'),
       page.waitForNavigation({ waitUntil: 'networkidle2' }),
     ]);
+    console.log(`[1/4] Login submitted. Current URL: ${page.url()}`);
+    if (page.url().includes('/authen')) {
+      throw new Error('Still on the login page after submitting - credentials likely rejected.');
+    }
 
     // ---------- Walk the order list, letting Apollo's cache accumulate ----------
+    console.log('[2/4] Loading order list...');
     await page.goto('https://www.shipnity.com/order/', { waitUntil: 'networkidle2' });
 
     const pagesCount = await page.evaluate(() => {
@@ -100,6 +112,7 @@ async function main() {
       return input ? parseInt(input.getAttribute('max') || '1', 10) : 1;
     });
     const lastPage = Math.min(pagesCount || 1, MAX_PAGES);
+    console.log(`[2/4] Found ${pagesCount || 1} page(s) of orders, visiting ${lastPage}.`);
 
     for (let p = 1; p <= lastPage; p++) {
       if (p > 1) {
@@ -112,10 +125,12 @@ async function main() {
         }, p);
         await page.keyboard.press('Enter');
         await page.waitForNetworkIdle({ idleTime: 500, timeout: 15000 }).catch(() => {});
+        console.log(`[2/4] Visited page ${p}/${lastPage}.`);
       }
     }
 
     // ---------- Pull everything out of the Apollo cache at once ----------
+    console.log('[3/4] Extracting Apollo cache...');
     const orders = await page.evaluate(() => {
       const cache = window.__APOLLO_CLIENT__.cache.extract();
       const orderKeys = Object.keys(cache).filter((k) => k.startsWith('Order:'));
@@ -140,11 +155,13 @@ async function main() {
         }));
     });
 
+    console.log(`[3/4] Extracted ${orders.length} open order(s) from the cache.`);
     if (!orders.length) {
       throw new Error('Extracted 0 orders from the Apollo cache - schema likely changed, aborting sync.');
     }
 
     // ---------- Push to the live site ----------
+    console.log('[4/4] Posting to sync endpoint...');
     const res = await fetch(SYNC_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -161,10 +178,18 @@ async function main() {
 
     console.log(`Synced ${orders.length} orders successfully.`);
   } catch (err) {
+    console.error('--- Sync failed ---');
+    console.error('Message:', err && err.message);
+    console.error('Name:', err && err.name);
+    console.error('Stack:', err && err.stack);
     try {
       const pages = await browser.pages();
       const page = pages[pages.length - 1];
-      if (page) await page.screenshot({ path: 'shipnity-error.png', fullPage: true });
+      if (page) {
+        console.error('Current URL at time of failure:', page.url());
+        await page.screenshot({ path: 'shipnity-error.png', fullPage: true });
+        console.error('Saved screenshot to shipnity-error.png');
+      }
     } catch (screenshotErr) {
       console.error('Failed to capture error screenshot:', screenshotErr);
     }
@@ -175,6 +200,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error('Fatal error, exiting with code 1:', err);
   process.exit(1);
 });
